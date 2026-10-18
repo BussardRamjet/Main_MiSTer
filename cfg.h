@@ -36,6 +36,8 @@ typedef struct {
 	uint8_t bootscreen;
 	uint8_t vscale_mode;
 	uint16_t vscale_border;
+	uint8_t vscale_crop;
+	int16_t vscale_crop_offset;
 	uint8_t rbf_hide_datecode;
 	uint8_t menu_pal;
 	int16_t bootcore_timeout;

@@ -63,6 +63,8 @@ static const ini_var_t ini_vars[] =
 	{ "BOOTSCREEN", (void*)(&(cfg.bootscreen)), UINT8, 0, 1 },
 	{ "VSCALE_MODE", (void*)(&(cfg.vscale_mode)), UINT8, 0, 5 },
 	{ "VSCALE_BORDER", (void*)(&(cfg.vscale_border)), UINT16, 0, 399 },
+	{ "VSCALE_CROP", (void*)(&(cfg.vscale_crop)), UINT8, 0, 1 },
+	{ "VSCALE_CROP_OFFSET", (void*)(&(cfg.vscale_crop_offset)), INT16, -1024, 1024 },
 	{ "RBF_HIDE_DATECODE", (void*)(&(cfg.rbf_hide_datecode)), UINT8, 0, 1 },
 	{ "MENU_PAL", (void*)(&(cfg.menu_pal)), UINT8, 0, 1 },
 	{ "BOOTCORE", (void*)(&(cfg.bootcore)), STRING, 0, sizeof(cfg.bootcore) - 1 },

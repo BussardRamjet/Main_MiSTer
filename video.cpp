@@ -2233,6 +2233,9 @@ static void set_vrr_mode()
 	if (!supports_vrr() || video_vsync_adjust()) use_vrr = 0;
 }
 
+static bool video_analog_scaler();
+static void set_yc_mode();
+
 static void video_set_mode(vmode_custom_t *v, double Fpix)
 {
 	PROFILE_FUNCTION();
@@ -2334,6 +2337,9 @@ static void video_set_mode(vmode_custom_t *v, double Fpix)
 	video_fb_config();
 
 	setShadowMask();
+
+	// Y/C encoded from the scaler depends on the output mode, not the core.
+	if (video_analog_scaler()) set_yc_mode();
 }
 
 static int parse_custom_video_mode(char* vcfg, vmode_custom_t *v)
@@ -3068,18 +3074,64 @@ static void video_resolution_adjust(const VideoInfo *vi, vmode_custom_t *vm)
 	setPLL(vm->Fpix, vm);
 }
 
+// Crop the core image vertically instead of downscaling it when it is taller
+// than the output (e.g. 288 line PAL into a 240 line 15kHz NTSC mode), so every
+// remaining line stays 1:1. Returns the number of lines removed.
+static uint32_t video_crop_adjust(const VideoInfo *vi, uint32_t scrh)
+{
+	uint32_t top = 0, bottom = 0;
+	const uint32_t height = vi->height;
+
+	if (cfg.vscale_crop && cfg.vscale_mode < 4 && scrh && height > scrh && !vi->rotated && !vi->fb_en)
+	{
+		const int crop = height - scrh;
+		int t = crop / 2 + cfg.vscale_crop_offset;
+		if (t < 0) t = 0;
+		if (t > crop) t = crop;
+		top = t;
+		bottom = crop - t;
+		printf("Set vertical crop to : top %u, bottom %u (%u -> %u lines)\n", top, bottom, height, scrh);
+	}
+
+	spi_uio_cmd_cont(UIO_SET_VCROP);
+	spi_w(top);
+	spi_w(bottom);
+	DisableIO();
+
+	return top + bottom;
+}
+
+// Scaler driving S-Video/CVBS at 15kHz: the output is a TV raster that fills a
+// 4:3 tube whatever its pixel count, so the square pixel aspect calculation
+// does not apply. Returns the picture width for the core aspect ratio, or 0.
+static uint32_t video_tv_raster_width(const VideoInfo *vi, const vmode_custom_t *vm)
+{
+	const uint32_t htotal = vm->param.hact + vm->param.hfp + vm->param.hs + vm->param.hbp;
+	if ((cfg.vga_mode_int != 2 && cfg.vga_mode_int != 3) || !video_analog_scaler()) return 0;
+	if (!htotal || (vm->Fpix * 1000000.0 / htotal) >= 20000.0 || vi->arxy) return 0;
+
+	uint32_t w = vm->param.hact;
+	if (vi->arx && vi->ary)
+	{
+		const uint32_t aw = (w * vi->arx * 3) / (vi->ary * 4);
+		if (aw < w) w = aw;
+	}
+	return w;
+}
+
 static void video_scaling_adjust(const VideoInfo *vi, const vmode_custom_t *vm)
 {
 	if (cfg.vscale_mode >= 4)
 	{
+		video_crop_adjust(vi, 0);
 		spi_uio_cmd16(UIO_SETHEIGHT, 0);
 		spi_uio_cmd16(UIO_SETWIDTH, 0);
 		return;
 	}
 
-	const uint32_t height = vi->rotated ? vi->width : vi->height;
-
 	uint32_t scrh = vm->item[5];
+	const uint32_t height = (vi->rotated ? vi->width : vi->height) - video_crop_adjust(vi, scrh);
+
 	if (scrh)
 	{
 		if (cfg.vscale_mode && height)
@@ -3105,7 +3157,13 @@ static void video_scaling_adjust(const VideoInfo *vi, const vmode_custom_t *vm)
 	}
 
 	uint32_t scrw = vm->item[1];
-	if (scrw)
+	const uint32_t tvw = video_tv_raster_width(vi, vm);
+	if (tvw)
+	{
+		printf("Set TV raster width to : %d\n", tvw);
+		spi_uio_cmd16(UIO_SETWIDTH, 0x8000 | tvw);
+	}
+	else if (scrw)
 	{
 		if (cfg.vscale_border && !(cfg.vscale_mode && height))
 		{
@@ -3204,10 +3262,66 @@ static uint64_t calc_frame_locked_phase(uint64_t fsc_num, uint64_t fsc_den,
 	) & 0xFFFFFFFFFFULL;
 }
 
+static bool video_analog_scaler()
+{
+	// Analog output is taken from the scaler instead of the core.
+	return cfg.vga_scaler || get_vga_fb();
+}
+
+static void send_yc_par(uint16_t yc_config, int64_t phase_inc, int colorburst_range, uint16_t subcarrier_enable)
+{
+	printf("Sending YC config to FPGA: 0x%02X (pal_en=%d, cvbs=%d, yc_en=%d)\n", yc_config, (yc_config >> 2) & 1, (yc_config >> 1) & 1, yc_config & 1);
+	spi_uio_cmd_cont(UIO_SET_YC_PAR);
+	spi_w(yc_config);
+	spi_w(phase_inc);
+	spi_w(phase_inc >> 16);
+	spi_w(phase_inc >> 32);
+	spi_w(colorburst_range);
+	spi_w(colorburst_range >> 16);
+	// Case 6: Send subcarrier enable flag
+	printf("Sending subcarrier enable to FPGA: %d\n", subcarrier_enable);
+	spi_w(subcarrier_enable);
+	DisableIO();
+}
+
+// S-Video/CVBS encoded from the scaler output (vga_scaler=1). The encoder runs
+// on the HDMI pixel clock, so the subcarrier and PAL/NTSC standard follow the
+// output video_mode rather than the core. With vsync_adjust=0 this lets a 50Hz
+// core drive a 60Hz-only TV through the triple buffer.
+static void set_yc_mode_scaler()
+{
+	const uint32_t htotal = v_cur.param.hact + v_cur.param.hfp + v_cur.param.hs + v_cur.param.hbp;
+	const uint32_t vtotal = v_cur.param.vact + v_cur.param.vfp + v_cur.param.vs + v_cur.param.vbp;
+	const double CLK_VIDEO = v_cur.Fpix;
+	const double fps = (htotal && vtotal) ? (CLK_VIDEO * 1000000.0) / ((double)htotal * vtotal) : 0;
+	const int pal = fps < 55.0;
+	const double CLK_REF = (pal || (cfg.ntsc_mode == 1)) ? 4.43361875 : (cfg.ntsc_mode == 2) ? 3.575611 : 3.579545;
+
+	const int64_t PHASE_INC = llround((CLK_REF / CLK_VIDEO) * 1099511627776.0) & 0xFFFFFFFFFFLL;
+
+	int COLORBURST_START = (int)(3.7 * (CLK_VIDEO / CLK_REF));
+	int COLORBURST_END = (int)(9.0 * (CLK_VIDEO / CLK_REF)) + COLORBURST_START;
+	if (COLORBURST_START > 127) COLORBURST_START = 127;
+	if (COLORBURST_END > 1023) COLORBURST_END = 1023;
+	const int COLORBURST_RANGE = (COLORBURST_START << 10) | COLORBURST_END;
+
+	printf("Calculated scaler YC parameters for %ux%u %.4fMHz %.2fHz: %s PHASE_INC=%lld, COLORBURST_START=%d, COLORBURST_END=%d\n",
+		v_cur.param.hact, v_cur.param.vact, CLK_VIDEO, fps, pal ? "PAL" : (cfg.ntsc_mode == 1) ? "PAL60" : (cfg.ntsc_mode == 2) ? "PAL-M" : "NTSC",
+		PHASE_INC, COLORBURST_START, COLORBURST_END);
+
+	send_yc_par(((pal || cfg.ntsc_mode) ? 4 : 0) | ((cfg.vga_mode_int == 3) ? 3 : 1), PHASE_INC, COLORBURST_RANGE, 0);
+}
+
 static void set_yc_mode()
 {
+	// Encode the scaler output when the analog port is fed from the scaler.
+	// Subcarrier-only mode (4) remains tied to the core clock.
+	if ((cfg.vga_mode_int == 2 || cfg.vga_mode_int == 3) && video_analog_scaler() && v_cur.Fpix > 0)
+	{
+		set_yc_mode_scaler();
+	}
 	// Enable YC for S-Video/CVBS modes, or subcarrier for CXA2075 encoders
-	if (cfg.vga_mode_int >= 2)
+	else if (cfg.vga_mode_int >= 2)
 	{
 		float fps = current_video_info.vtime ? (100000000.f / current_video_info.vtime) : 0.f;
 		int pal = fps < 55.f;
@@ -3295,7 +3409,6 @@ static void set_yc_mode()
 			}
 		}
 
-		spi_uio_cmd_cont(UIO_SET_YC_PAR);
 		// For traditional S-Video/CVBS modes, enable YC processing
 		// For subcarrier-only modes (RGB+subcarrier or direct video), keep yc_en=0
 		bool is_subcarrier_only = (cfg.vga_mode_int == 4);
@@ -3307,18 +3420,7 @@ static void set_yc_mode()
 			// Traditional YC modes: enable YC processing
 			yc_config = ((pal || cfg.ntsc_mode) ? 4 : 0) | ((cfg.vga_mode_int == 3) ? 3 : 1);
 		}
-		printf("Sending YC config to FPGA: 0x%02X (pal_en=%d, cvbs=%d, yc_en=%d)\n", yc_config, (yc_config >> 2) & 1, (yc_config >> 1) & 1, yc_config & 1);
-		spi_w(yc_config);
-		spi_w(PHASE_INC);
-		spi_w(PHASE_INC >> 16);
-		spi_w(PHASE_INC >> 32);
-		spi_w(COLORBURST_RANGE);
-		spi_w(COLORBURST_RANGE >> 16);
-		// Case 6: Send subcarrier enable flag
-		uint16_t subcarrier_enable = (cfg.vga_mode_int == 4) ? 1 : 0;
-		printf("Sending subcarrier enable to FPGA: %d\n", subcarrier_enable);
-		spi_w(subcarrier_enable);
-		DisableIO();
+		send_yc_par(yc_config, PHASE_INC, COLORBURST_RANGE, (cfg.vga_mode_int == 4) ? 1 : 0);
 	}
 	else
 	{
